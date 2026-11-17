@@ -13,20 +13,77 @@ let confirmedCall = false;
 const RING_DURATION_MS = 6000;
 // Intervalo curto para reduzir o tempo de resposta quando o DOM não muda.
 const CALL_POLL_INTERVAL_MS = 100;
-let incomingCallPort = null;
+let monitorInterval = null;
+let logInterval = null;
+let pageObserver = null;
+let contextCheckInterval = null;
+let contextReloadStarted = false;
 
-function connectToBackground() {
-    incomingCallPort = chrome.runtime.connect({
-        name: "call-alert"
-    });
-
-    incomingCallPort.onDisconnect.addListener(() => {
-        incomingCallPort = null;
-        setTimeout(connectToBackground, 100);
-    });
+function isExtensionContextValid() {
+    try {
+        if (!globalThis.chrome || !chrome.runtime) {
+            return false;
+        }
+        const extensionId = chrome.runtime.id;
+        return Boolean(extensionId);
+    } catch (error) {
+        return false;
+    }
 }
 
-connectToBackground();
+function safeSendMessage(message) {
+    if (!isExtensionContextValid()) {
+        stopInvalidatedContextTimers();
+        return false;
+    }
+
+    try {
+        chrome.runtime.sendMessage(message);
+        return true;
+    } catch (error) {
+        stopInvalidatedContextTimers();
+        return false;
+    }
+}
+
+function safeGetExtensionUrl(path) {
+    if (!isExtensionContextValid()) {
+        return null;
+    }
+
+    try {
+        return chrome.runtime.getURL(path);
+    } catch (error) {
+        stopInvalidatedContextTimers();
+        return null;
+    }
+}
+
+function stopInvalidatedContextTimers() {
+    if (typeof stopRingtone === "function") {
+        stopRingtone();
+    }
+    if (typeof stopBlink === "function") {
+        stopBlink();
+    }
+
+    if (monitorInterval) {
+        clearInterval(monitorInterval);
+        monitorInterval = null;
+    }
+    if (logInterval) {
+        clearInterval(logInterval);
+        logInterval = null;
+    }
+    if (pageObserver) {
+        pageObserver.disconnect();
+        pageObserver = null;
+    }
+    if (contextCheckInterval) {
+        clearInterval(contextCheckInterval);
+        contextCheckInterval = null;
+    }
+}
 
 // Título original da página, usado para restaurá-lo após o alerta.
 const originalTitle = document.title;
@@ -133,9 +190,12 @@ function prepareRingtone() {
         return;
     }
 
-    ringtone = new Audio(
-        chrome.runtime.getURL("ring.mp3")
-    );
+    const ringtoneUrl = safeGetExtensionUrl("ring.mp3");
+    if (!ringtoneUrl) {
+        return;
+    }
+
+    ringtone = new Audio(ringtoneUrl);
 
     ringtone.preload = "auto";
     ringtone.loop = true;
@@ -198,22 +258,9 @@ function incomingCall() {
     playRingtone();
 
     // Solicita ao service worker a notificação e o foco na aba do Olos.
-    if (incomingCallPort) {
-        try {
-            incomingCallPort.postMessage({
-                type: "incomingCall"
-            });
-        } catch (error) {
-            incomingCallPort = null;
-            chrome.runtime.sendMessage({
-                type: "incomingCall"
-            });
-        }
-    } else {
-        chrome.runtime.sendMessage({
-            type: "incomingCall"
-        });
-    }
+    safeSendMessage({
+        type: "incomingCall"
+    });
 
     // Inicia o alerta visual no título da página.
     startBlink();
@@ -227,20 +274,31 @@ function callFinished() {
     stopBlink();
 }
 
-// Recebe comandos enviados pelo ícone da extensão ou pelo service worker.
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+// Recebe comandos enviados pelo ícone da extensão ou pela notificação.
+if (isExtensionContextValid()) {
+    try {
+        chrome.runtime.onMessage.addListener((message) => {
+            if (!isExtensionContextValid()) {
+                stopInvalidatedContextTimers();
+                return;
+            }
 
-    // Ignora mensagens que não sejam comandos para parar o ring.
-    if (message.type !== "stopRingtone") {
-        return;
+            if (message.type === "stopRingtone") {
+                callFinished();
+            }
+        });
+    } catch (error) {
+        stopInvalidatedContextTimers();
     }
-
-    // Interrompe o áudio e o alerta visual imediatamente.
-    callFinished();
-});
+}
 
 // Verifica o estado da chamada e controla o início e o fim dos alertas.
 function monitor() {
+
+    if (!isExtensionContextValid()) {
+        stopInvalidatedContextTimers();
+        return;
+    }
 
     // Lê os sinais atuais exibidos na interface do Olos.
     const detected = callDetected();
@@ -275,21 +333,36 @@ updateTestStatus("callAlert", "ready");
 prepareRingtone();
 
 // Executa uma verificação periódica mesmo quando a página não sofre alterações.
-setInterval(monitor, CALL_POLL_INTERVAL_MS);
+monitorInterval = setInterval(monitor, CALL_POLL_INTERVAL_MS);
+
+// Recarrega uma aba stale após atualização ou desativação da extensão.
+contextCheckInterval = setInterval(() => {
+    if (isExtensionContextValid()) {
+        return;
+    }
+
+    if (contextReloadStarted) {
+        return;
+    }
+
+    contextReloadStarted = true;
+    stopInvalidatedContextTimers();
+    window.location.reload();
+}, 500);
 
 // Observa mudanças no DOM para reagir rapidamente à confirmação da chamada.
-const observer = new MutationObserver(() => {
+pageObserver = new MutationObserver(() => {
     monitor();
 });
 
-observer.observe(document.body, {
+pageObserver.observe(document.body, {
     childList: true,
     subtree: true,
     attributes: true
 });
 
 // Exibe a pontuação no console para facilitar testes e diagnóstico.
-setInterval(() => {
+logInterval = setInterval(() => {
     console.log(
         "Score:",
         callScore()

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Call Alert",
   "version": "1.2",
-  "description": "Alerta para chamadas recebidas no Olos.",
+  "description": "Alerta para chamadas recebidas.",
   "permissions": [
     "notifications",
     "tabs"

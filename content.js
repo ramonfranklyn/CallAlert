@@ -13,6 +13,20 @@ let confirmedCall = false;
 const RING_DURATION_MS = 6000;
 // Intervalo curto para reduzir o tempo de resposta quando o DOM não muda.
 const CALL_POLL_INTERVAL_MS = 100;
+let incomingCallPort = null;
+
+function connectToBackground() {
+    incomingCallPort = chrome.runtime.connect({
+        name: "call-alert"
+    });
+
+    incomingCallPort.onDisconnect.addListener(() => {
+        incomingCallPort = null;
+        setTimeout(connectToBackground, 100);
+    });
+}
+
+connectToBackground();
 
 // Título original da página, usado para restaurá-lo após o alerta.
 const originalTitle = document.title;
@@ -180,13 +194,26 @@ function stopRingtone() {
 // Reúne as ações executadas quando uma nova chamada é confirmada.
 function incomingCall() {
 
-    // Solicita ao service worker a notificação e o foco na aba do Olos.
-    chrome.runtime.sendMessage({
-        type: "incomingCall"
-    });
-
-    // Inicia o alerta sonoro.
+    // Inicia o alerta sonoro antes da comunicação assíncrona com o service worker.
     playRingtone();
+
+    // Solicita ao service worker a notificação e o foco na aba do Olos.
+    if (incomingCallPort) {
+        try {
+            incomingCallPort.postMessage({
+                type: "incomingCall"
+            });
+        } catch (error) {
+            incomingCallPort = null;
+            chrome.runtime.sendMessage({
+                type: "incomingCall"
+            });
+        }
+    } else {
+        chrome.runtime.sendMessage({
+            type: "incomingCall"
+        });
+    }
 
     // Inicia o alerta visual no título da página.
     startBlink();

@@ -1,6 +1,8 @@
-const INCOMING_CALL_NOTIFICATION_ID = "incoming-call";
+const INCOMING_CALL_NOTIFICATION_PREFIX = "incoming-call";
 
 let alertTabId = null;
+let activeNotificationId = null;
+let notificationSequence = 0;
 
 function stopRingtoneInTab(tabId) {
 
@@ -17,13 +19,38 @@ function showIncomingCallNotification(sender) {
 
     alertTabId = sender && sender.tab ? sender.tab.id : null;
 
+    notificationSequence++;
+    const notificationId =
+        `${INCOMING_CALL_NOTIFICATION_PREFIX}-${notificationSequence}`;
+
+    if (activeNotificationId) {
+        chrome.notifications.clear(activeNotificationId);
+    }
+
+    activeNotificationId = notificationId;
+
     // Cria a notificação antes de qualquer consulta ou mudança de aba.
-    chrome.notifications.create(INCOMING_CALL_NOTIFICATION_ID, {
+    chrome.notifications.create(notificationId, {
         type: "basic",
         iconUrl: "icon.png",
         title: "Nova Ligação",
         message: "Você possui uma chamada receptiva.",
-        priority: 2
+        priority: 2,
+        silent: false,
+        requireInteraction: true,
+        eventTime: Date.now()
+    }, (createdNotificationId) => {
+        if (chrome.runtime.lastError) {
+            console.error(
+                "Falha ao criar notificação:",
+                chrome.runtime.lastError.message
+            );
+            activeNotificationId = null;
+            return;
+        }
+
+        activeNotificationId =
+            createdNotificationId || notificationId;
     });
 
     // Procura todas as abas abertas para localizar o Olos.
@@ -78,8 +105,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // Encaminha um comando de parada para a aba ativa.
     if (message.type === "stopRingtone") {
-        chrome.notifications.clear(INCOMING_CALL_NOTIFICATION_ID);
+        if (activeNotificationId) {
+            chrome.notifications.clear(activeNotificationId);
+        }
         alertTabId = null;
+        activeNotificationId = null;
 
         chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
             // Obtém a aba atualmente ativa na janela do navegador.
@@ -102,7 +132,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // O clique na notificação encerra o alerta na aba que detectou a chamada.
 chrome.notifications.onClicked.addListener((notificationId) => {
 
-    if (notificationId !== INCOMING_CALL_NOTIFICATION_ID) {
+    if (!notificationId.startsWith(INCOMING_CALL_NOTIFICATION_PREFIX)) {
         return;
     }
 
@@ -122,6 +152,13 @@ chrome.notifications.onClicked.addListener((notificationId) => {
     }
 
     alertTabId = null;
+    activeNotificationId = null;
+});
+
+chrome.notifications.onClosed.addListener((notificationId) => {
+    if (notificationId === activeNotificationId) {
+        activeNotificationId = null;
+    }
 });
 
 // Usa o clique no ícone da extensão como interrupção manual do ring.
@@ -131,8 +168,11 @@ chrome.action.onClicked.addListener((tab) => {
         return;
     }
 
-    chrome.notifications.clear(INCOMING_CALL_NOTIFICATION_ID);
+    if (activeNotificationId) {
+        chrome.notifications.clear(activeNotificationId);
+    }
     alertTabId = null;
+    activeNotificationId = null;
 
     // Envia o comando de parada diretamente para a aba clicada.
     chrome.tabs.sendMessage(tab.id, {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Call Alert",
-  "version": "1.9",
+  "version": "2.0",
   "description": "Alerta para chamadas recebidas.",
   "permissions": [
     "notifications",
@@ -29,7 +29,7 @@
       "js": [
         "content.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ],
   "web_accessible_resources": [

@@ -4,6 +4,8 @@ let callActive = false;
 let blinkInterval = null;
 // Mantém a instância do áudio enquanto o ring estiver tocando.
 let ringtone = null;
+let ringtoneReady = false;
+let ringtonePending = false;
 // Guarda o temporizador que limita a duração do ring.
 let ringtoneTimer = null;
 // Evita disparar o mesmo alerta várias vezes para a mesma chamada.
@@ -18,6 +20,7 @@ let logInterval = null;
 let pageObserver = null;
 let contextCheckInterval = null;
 let contextReloadStarted = false;
+let monitoringStarted = false;
 
 function isExtensionContextValid() {
     try {
@@ -86,11 +89,11 @@ function stopInvalidatedContextTimers() {
 }
 
 // Título original da página, usado para restaurá-lo após o alerta.
-const originalTitle = document.title;
+let originalTitle = document.title;
 const isLocalTestPage = ["localhost", "127.0.0.1"].includes(location.hostname);
 
 function updateTestStatus(attribute, value) {
-    if (isLocalTestPage) {
+    if (isLocalTestPage && document.documentElement) {
         document.documentElement.dataset[attribute] = value;
     }
 }
@@ -195,28 +198,49 @@ function prepareRingtone() {
         return;
     }
 
-    ringtone = new Audio(ringtoneUrl);
-
+    ringtone = new Audio();
     ringtone.preload = "auto";
     ringtone.loop = true;
     ringtone.volume = 0.6;
+    ringtone.addEventListener("canplay", () => {
+        ringtoneReady = true;
+        updateTestStatus("callAlertAudio", "ready");
+
+        if (ringtonePending) {
+            ringtonePending = false;
+            startRingtonePlayback();
+        }
+    }, { once: true });
+    ringtone.addEventListener("error", () => {
+        ringtonePending = false;
+        updateTestStatus("callAlertAudio", "error");
+        console.error("Falha ao carregar o áudio do alerta.", ringtone.error);
+    }, { once: true });
+    ringtone.src = ringtoneUrl;
+    updateTestStatus("callAlertAudio", "loading");
     ringtone.load();
 }
 
-// Inicia o áudio do ring já pré-carregado.
-function playRingtone() {
+function startRingtonePlayback() {
 
-    // Impede a criação de mais de um áudio ao mesmo tempo.
-    if (ringtone && !ringtone.paused) {
+    if (!ringtone || !ringtoneReady || !ringtone.paused) {
         return;
     }
 
-    prepareRingtone();
     ringtone.currentTime = 0;
 
-    // Inicia a reprodução e registra falhas de autoplay ou carregamento.
+    // Inicia a reprodução e só começa a contar a duração quando o áudio tocar.
     ringtone.play()
-        .then(() => updateTestStatus("callAlertAudio", "playing"))
+        .then(() => {
+            if (ringtone.paused) {
+                return;
+            }
+
+            updateTestStatus("callAlertAudio", "playing");
+            ringtoneTimer = setTimeout(() => {
+                stopRingtone();
+            }, RING_DURATION_MS);
+        })
         .catch((error) => {
             updateTestStatus(
                 "callAlertAudio",
@@ -224,11 +248,28 @@ function playRingtone() {
             );
             console.error(error);
         });
+}
 
-    // Encerra o alerta após o tempo máximo configurado.
-    ringtoneTimer = setTimeout(() => {
-        stopRingtone();
-    }, RING_DURATION_MS);
+// Inicia imediatamente se o áudio estiver pronto; caso contrário aguarda o preload.
+function playRingtone() {
+
+    if (ringtone && !ringtone.paused) {
+        return;
+    }
+
+    prepareRingtone();
+    if (!ringtone) {
+        updateTestStatus("callAlertAudio", "error");
+        return;
+    }
+
+    if (!ringtoneReady) {
+        ringtonePending = true;
+        updateTestStatus("callAlertAudio", "loading");
+        return;
+    }
+
+    startRingtonePlayback();
 }
 
 // Para o áudio e libera os recursos associados ao ring.
@@ -239,9 +280,11 @@ function stopRingtone() {
         clearTimeout(ringtoneTimer);
         ringtoneTimer = null;
     }
+    ringtonePending = false;
 
     // Não há áudio ativo para interromper.
     if (!ringtone) {
+        updateTestStatus("callAlertAudio", "stopped");
         return;
     }
 
@@ -254,13 +297,13 @@ function stopRingtone() {
 // Reúne as ações executadas quando uma nova chamada é confirmada.
 function incomingCall() {
 
-    // Inicia o alerta sonoro antes da comunicação assíncrona com o service worker.
-    playRingtone();
-
-    // Solicita ao service worker a notificação e o foco na aba do Olos.
+    // Dispara a criação da notificação imediatamente, sem aguardar o service worker.
     safeSendMessage({
         type: "incomingCall"
     });
+
+    // Inicia o áudio em paralelo com a criação da notificação.
+    playRingtone();
 
     // Inicia o alerta visual no título da página.
     startBlink();
@@ -328,20 +371,49 @@ function monitor() {
     }
 }
 
-// Pré-carrega o áudio para que a chamada não aguarde a criação do elemento.
-updateTestStatus("callAlert", "ready");
-prepareRingtone();
-
-// Executa uma verificação periódica mesmo quando a página não sofre alterações.
-monitorInterval = setInterval(monitor, CALL_POLL_INTERVAL_MS);
-
-// Recarrega uma aba stale após atualização ou desativação da extensão.
-contextCheckInterval = setInterval(() => {
-    if (isExtensionContextValid()) {
+function startMonitoring() {
+    if (monitoringStarted) {
         return;
     }
 
-    if (contextReloadStarted) {
+    if (!document.body) {
+        document.addEventListener("DOMContentLoaded", startMonitoring, {
+            once: true
+        });
+        return;
+    }
+
+    monitoringStarted = true;
+    originalTitle = document.title;
+    updateTestStatus("callAlert", "ready");
+    updateTestStatus(
+        "callAlertAudio",
+        ringtoneReady ? "ready" : "loading"
+    );
+
+    // Executa uma verificação periódica mesmo quando o DOM não muda.
+    monitorInterval = setInterval(monitor, CALL_POLL_INTERVAL_MS);
+
+    // Observa mudanças do DOM para reagir sem aguardar o próximo ciclo.
+    pageObserver = new MutationObserver(monitor);
+    pageObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true
+    });
+
+    logInterval = setInterval(() => {
+        console.log("Score:", callScore());
+    }, 1000);
+}
+
+// Começa o preload na injeção do script, antes da página terminar de carregar.
+prepareRingtone();
+
+// Recarrega uma aba stale após atualização ou desativação da extensão.
+contextCheckInterval = setInterval(() => {
+    if (isExtensionContextValid() || contextReloadStarted) {
         return;
     }
 
@@ -350,21 +422,10 @@ contextCheckInterval = setInterval(() => {
     window.location.reload();
 }, 500);
 
-// Observa mudanças no DOM para reagir rapidamente à confirmação da chamada.
-pageObserver = new MutationObserver(() => {
-    monitor();
-});
-
-pageObserver.observe(document.body, {
-    childList: true,
-    subtree: true,
-    attributes: true
-});
-
-// Exibe a pontuação no console para facilitar testes e diagnóstico.
-logInterval = setInterval(() => {
-    console.log(
-        "Score:",
-        callScore()
-    );
-}, 1000);
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", startMonitoring, {
+        once: true
+    });
+} else {
+    startMonitoring();
+}
